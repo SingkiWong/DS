@@ -18,11 +18,14 @@ python train_cifar10_dsw.py --mode DSWD_MIX --epochs 10 --mix-ratio 0.15
 python train_cifar10_dsw.py --mode DSWD_TOPK --epochs 10 --topk-ratio 0.5
 python train_cifar10_dsw.py --mode DSWD_SN --epochs 10
 python train_cifar10_dsw.py --mode DSWD_GP --epochs 10 --gp-lambda 10.0
+
+# 关闭 FID/KID（默认开启）
+python train_cifar10_dsw.py --mode DSWD --epochs 10 --no-compute-fid-kid
 ```
 
 ## 3) 输出
 默认输出在 `./runs/<mode>/seed_<seed>/`：
-- `history.json`：每个 epoch 的指标（`g_sw`, `d_total`, `d_gp`, `selector_obj`）
+- `history.json`：每个 epoch 的指标（`g_sw`, `d_total`, `d_gp`, `selector_obj`, `fid`, `kid_mean`, `kid_std`）
 - `samples/epoch_XXX.png`：固定噪声采样图
 - `last.pt`：最新 checkpoint
 

@@ -4,6 +4,7 @@ python -m pip install -r requirements.txt
 
 REM Example: baseline DSW
 python train_cifar10_dsw.py --mode DSW --epochs 10 --batch-size 128 --data-root .\data --output-dir .\runs
+REM FID/KID is enabled by default. To disable: add --no-compute-fid-kid
 
 REM Example: DSWD with spectral normalization
 REM python train_cifar10_dsw.py --mode DSWD_SN --epochs 10 --batch-size 128 --data-root .\data --output-dir .\runs

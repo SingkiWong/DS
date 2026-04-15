@@ -1,7 +1,9 @@
 import argparse
 import json
 import random
+import shutil
 import time
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
@@ -13,6 +15,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
+
+try:
+    import torch_fidelity
+except Exception:
+    torch_fidelity = None
 
 
 @dataclass
@@ -45,6 +52,14 @@ class Config:
     mix_ratio: float = 0.15
     topk_ratio: float = 0.5
     gp_lambda: float = 10.0
+
+    # FID / KID evaluation
+    compute_fid_kid: bool = True
+    eval_every: int = 5
+    eval_samples: int = 2000
+    kid_subsets: int = 10
+    kid_subset_size: int = 100
+    fidelity_batch_size: int = 128
 
 
 def seed_everything(seed: int):
@@ -199,6 +214,88 @@ def make_models(cfg: Config, device):
     return G, D, selector, opt_g, opt_d, opt_t
 
 
+def to_uint8_batch(images: torch.Tensor) -> torch.Tensor:
+    # [-1,1] -> [0,255] uint8
+    x = (images.clamp(-1, 1) + 1.0) * 127.5
+    return x.round().to(torch.uint8)
+
+
+def save_uint8_tensor_dir(images_uint8: torch.Tensor, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for i, img in enumerate(images_uint8):
+        save_image(img.float() / 255.0, out_dir / f"{i:06d}.png")
+
+
+def ensure_real_eval_dir(cfg: Config, out_dir: Path):
+    real_dir = out_dir / "_fid_cache" / "real"
+    marker = real_dir / ".done"
+    if marker.exists():
+        return real_dir
+
+    if real_dir.exists():
+        shutil.rmtree(real_dir)
+    real_dir.mkdir(parents=True, exist_ok=True)
+
+    tfm = transforms.Compose([
+        transforms.Resize(cfg.image_size),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+    test_ds = datasets.CIFAR10(cfg.data_root, train=False, download=True, transform=tfm)
+
+    imgs = []
+    for i in range(min(len(test_ds), cfg.eval_samples)):
+        x, _ = test_ds[i]
+        imgs.append(x)
+    images = torch.stack(imgs, dim=0)
+    save_uint8_tensor_dir(to_uint8_batch(images), real_dir)
+    marker.write_text("ok", encoding="utf-8")
+    return real_dir
+
+
+@torch.no_grad()
+def evaluate_fid_kid(cfg: Config, G: nn.Module, device: torch.device, out_dir: Path, epoch: int):
+    if not cfg.compute_fid_kid:
+        return None
+    if torch_fidelity is None:
+        warnings.warn("torch-fidelity not installed, skip FID/KID evaluation.")
+        return None
+
+    real_dir = ensure_real_eval_dir(cfg, out_dir)
+    fake_dir = out_dir / "_fid_cache" / "fake" / f"epoch_{epoch:03d}"
+    if fake_dir.exists():
+        shutil.rmtree(fake_dir)
+    fake_dir.mkdir(parents=True, exist_ok=True)
+
+    G.eval()
+    collected = 0
+    chunks = []
+    while collected < cfg.eval_samples:
+        bs = min(256, cfg.eval_samples - collected)
+        z = torch.randn(bs, cfg.latent_size, device=device)
+        chunks.append(G(z).detach().cpu())
+        collected += bs
+    fake_images = torch.cat(chunks, dim=0)
+    save_uint8_tensor_dir(to_uint8_batch(fake_images), fake_dir)
+
+    metrics = torch_fidelity.calculate_metrics(
+        input1=str(fake_dir),
+        input2=str(real_dir),
+        cuda=(device.type == "cuda"),
+        fid=True,
+        kid=True,
+        kid_subsets=cfg.kid_subsets,
+        kid_subset_size=cfg.kid_subset_size,
+        batch_size=cfg.fidelity_batch_size,
+        verbose=False,
+    )
+    return {
+        "fid": float(metrics["frechet_inception_distance"]),
+        "kid_mean": float(metrics["kernel_inception_distance_mean"]),
+        "kid_std": float(metrics["kernel_inception_distance_std"]),
+    }
+
+
 def train(cfg: Config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed_everything(cfg.seed)
@@ -292,8 +389,22 @@ def train(cfg: Config):
             "time_sec": round(time.time() - t0, 2),
             **{k: float(np.mean(v)) for k, v in meters.items()},
         }
+        eval_metrics = None
+        if cfg.compute_fid_kid and (epoch % cfg.eval_every == 0 or epoch == cfg.epochs):
+            eval_metrics = evaluate_fid_kid(cfg, G, device, out_dir, epoch)
+        if eval_metrics is not None:
+            row.update(eval_metrics)
+        else:
+            row.update({"fid": None, "kid_mean": None, "kid_std": None})
         history.append(row)
-        print(f"[{cfg.mode}] epoch {epoch:03d}/{cfg.epochs} | g_sw={row['g_sw']:.4f} d={row['d_total']:.4f} gp={row['d_gp']:.4f}")
+        if row["fid"] is None:
+            print(f"[{cfg.mode}] epoch {epoch:03d}/{cfg.epochs} | g_sw={row['g_sw']:.4f} d={row['d_total']:.4f} gp={row['d_gp']:.4f}")
+        else:
+            print(
+                f"[{cfg.mode}] epoch {epoch:03d}/{cfg.epochs} | "
+                f"g_sw={row['g_sw']:.4f} d={row['d_total']:.4f} gp={row['d_gp']:.4f} "
+                f"FID={row['fid']:.3f} KID={row['kid_mean']:.6f}±{row['kid_std']:.6f}"
+            )
 
         torch.save({
             "epoch": epoch,
@@ -324,6 +435,13 @@ def parse_args():
     p.add_argument("--mix-ratio", type=float, default=0.15)
     p.add_argument("--topk-ratio", type=float, default=0.5)
     p.add_argument("--gp-lambda", type=float, default=10.0)
+    p.add_argument("--compute-fid-kid", action="store_true", default=True)
+    p.add_argument("--no-compute-fid-kid", action="store_false", dest="compute_fid_kid")
+    p.add_argument("--eval-every", type=int, default=5)
+    p.add_argument("--eval-samples", type=int, default=2000)
+    p.add_argument("--kid-subsets", type=int, default=10)
+    p.add_argument("--kid-subset-size", type=int, default=100)
+    p.add_argument("--fidelity-batch-size", type=int, default=128)
     return p.parse_args()
 
 
@@ -345,6 +463,12 @@ def main():
         mix_ratio=args.mix_ratio,
         topk_ratio=args.topk_ratio,
         gp_lambda=args.gp_lambda,
+        compute_fid_kid=args.compute_fid_kid,
+        eval_every=args.eval_every,
+        eval_samples=args.eval_samples,
+        kid_subsets=args.kid_subsets,
+        kid_subset_size=args.kid_subset_size,
+        fidelity_batch_size=args.fidelity_batch_size,
     )
     train(cfg)
 
